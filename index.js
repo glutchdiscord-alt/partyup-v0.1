@@ -1059,7 +1059,7 @@ async function reopenLfg(session) {
             }).join('\n'), inline: false },
             { name: '🔊 Voice Channel', value: `<#${session.voiceChannel}>\n*Private voice channel created for this team.\nAccess granted when you join!*`, inline: false }
         )
-        .setFooter({ text: `LFG #${session.id.slice(-6)} • Reopened for remaining spots` })
+        .setFooter({ text: `LFG #${session.id.slice(-6)} • Looking for ${session.playersNeeded - session.currentPlayers.length} more player(s)` })
         .setTimestamp();
     
     const joinButton = new ButtonBuilder()
@@ -1074,16 +1074,67 @@ async function reopenLfg(session) {
     const channel = guild.channels.cache.get(session.channel);
     
     if (channel) {
+        let messageUpdated = false;
+        
+        // Try to update the original message first
         try {
-            await channel.send({ 
-                content: `🚨 **LFG REOPENED** 🚨\n\n${session.currentPlayers.map(id => `<@${id}>`).join(' ')} **Your team is waiting!**\n\nSome players didn't confirm in time, so we're looking for **${session.playersNeeded - session.currentPlayers.length} more player(s)** to complete the team.\n\n**Click "Join LFG" below to fill the remaining spots!**`,
-                embeds: [embed], 
-                components: [row],
-                allowedMentions: { users: session.currentPlayers }
-            });
-            console.log(`Successfully reopened LFG ${session.id} with ${session.currentPlayers.length} confirmed players`);
+            if (session.messageId) {
+                const originalMessage = await channel.messages.fetch(session.messageId);
+                await originalMessage.edit({ embeds: [embed], components: [row] });
+                console.log(`Updated original LFG message for reopened session ${session.id}`);
+                messageUpdated = true;
+            } else {
+                // Fallback: try to find the message if no ID stored
+                const messages = await channel.messages.fetch({ limit: 50 });
+                const originalMessage = messages.find(msg => 
+                    msg.embeds.length > 0 && 
+                    msg.embeds[0].footer?.text?.includes(session.id.slice(-6))
+                );
+                
+                if (originalMessage) {
+                    await originalMessage.edit({ embeds: [embed], components: [row] });
+                    console.log(`Updated LFG message using fallback search for reopened session ${session.id}`);
+                    messageUpdated = true;
+                }
+            }
         } catch (error) {
-            console.error('Error sending reopened LFG message:', error);
+            console.error('Error updating original message:', error);
+            
+            // If message fetch failed, try broader search to find and update the button
+            try {
+                const messages = await channel.messages.fetch({ limit: 100 });
+                const originalMessage = messages.find(msg => 
+                    msg.embeds.length > 0 && 
+                    msg.embeds[0].footer?.text?.includes(session.id.slice(-6)) &&
+                    (msg.components.length === 0 || 
+                     msg.components[0].components.some(comp => comp.customId?.includes(`join_lfg_${session.id}`)))
+                );
+                
+                if (originalMessage) {
+                    await originalMessage.edit({ embeds: [embed], components: [row] });
+                    console.log(`Found and updated LFG message using extended search for reopened session ${session.id}`);
+                    messageUpdated = true;
+                }
+            } catch (secondError) {
+                console.error('Extended search also failed:', secondError);
+            }
+        }
+        
+        // If we couldn't update the original message, send a new one as last resort
+        if (!messageUpdated) {
+            try {
+                const response = await channel.send({ 
+                    content: `${session.currentPlayers.map(id => `<@${id}>`).join(' ')} **A player left your LFG session!**\n\nYour team is looking for **${session.playersNeeded - session.currentPlayers.length} more player(s)** to complete the squad.`,
+                    embeds: [embed], 
+                    components: [row],
+                    allowedMentions: { users: session.currentPlayers }
+                });
+                // Update the session with new message ID
+                session.messageId = response.id;
+                console.log(`Sent new reopened message for session ${session.id} since original couldn't be updated`);
+            } catch (sendError) {
+                console.error('Error sending new reopened message:', sendError);
+            }
         }
     } else {
         console.error(`No suitable channel found to reopen LFG ${session.id}`);
