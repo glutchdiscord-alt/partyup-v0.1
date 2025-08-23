@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: lfg-discord-bot
+    env: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+    autoDeploy: false
