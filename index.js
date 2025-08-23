@@ -1244,57 +1244,62 @@ async function handleLeaveLfg(interaction) {
         });
     }
     
-    // Remove user from session
-    session.currentPlayers = session.currentPlayers.filter(id => id !== interaction.user.id);
-    session.confirmedPlayers = session.confirmedPlayers.filter(id => id !== interaction.user.id);
-    
-    // Remove voice channel access
     try {
-        const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannel);
-        if (voiceChannel) {
-            await voiceChannel.permissionOverwrites.delete(interaction.user.id);
-            // Disconnect if user is in the voice channel
-            if (interaction.member.voice.channel?.id === session.voiceChannel) {
-                await interaction.member.voice.disconnect('Left LFG session');
-            }
-        }
-    } catch (error) {
-        console.error('Error removing voice channel access:', error);
-    }
-    
-    console.log(`Player ${interaction.user.displayName} left session ${sessionId}`);
-    
-    // If session becomes empty (only creator left and creator somehow left), clean it up
-    if (session.currentPlayers.length === 0) {
+        // First reply to the interaction immediately to prevent timeout
+        await interaction.reply({ content: '✅ You left the LFG session.', flags: 64 });
+        
+        // Remove user from session
+        session.currentPlayers = session.currentPlayers.filter(id => id !== interaction.user.id);
+        session.confirmedPlayers = session.confirmedPlayers.filter(id => id !== interaction.user.id);
+        
+        // Remove voice channel access
         try {
             const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannel);
             if (voiceChannel) {
-                await voiceChannel.delete();
+                await voiceChannel.permissionOverwrites.delete(interaction.user.id);
+                // Disconnect if user is in the voice channel
+                if (interaction.member.voice.channel?.id === session.voiceChannel) {
+                    await interaction.member.voice.disconnect('Left LFG session');
+                }
             }
         } catch (error) {
-            console.error('Error deleting voice channel:', error);
+            console.error('Error removing voice channel access:', error);
         }
-        activeSessions.delete(sessionId);
         
-        const emptyEmbed = new EmbedBuilder()
-            .setColor(0x95a5a6)
-            .setTitle('💭 LFG Session Empty')
-            .setDescription('All players have left this session.')
-            .setTimestamp();
+        console.log(`Player ${interaction.user.displayName} left session ${sessionId}`);
         
-        await interaction.reply({ 
-            content: '✅ You left the LFG session. The session was empty and has been closed.',
-            embeds: [emptyEmbed], 
-            flags: 64 
-        });
-        return;
+        // If session becomes empty, clean it up
+        if (session.currentPlayers.length === 0) {
+            try {
+                const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannel);
+                if (voiceChannel) {
+                    await voiceChannel.delete();
+                }
+            } catch (error) {
+                console.error('Error deleting voice channel:', error);
+            }
+            activeSessions.delete(sessionId);
+            console.log(`Session ${sessionId} deleted - no players remaining`);
+            return;
+        }
+        
+        // Update the session embed and reopen for new joiners
+        await reopenLfg(session);
+        
+    } catch (error) {
+        console.error('Error in handleLeaveLfg:', error);
+        // If interaction hasn't been replied to yet, send error message
+        if (!interaction.replied && !interaction.deferred) {
+            try {
+                await interaction.reply({ 
+                    content: '❌ There was an error processing your request. Please try again.', 
+                    flags: 64 
+                });
+            } catch (replyError) {
+                console.error('Error sending error reply:', replyError);
+            }
+        }
     }
-    
-    // First reply to the interaction
-    await interaction.reply({ content: '✅ You left the LFG session.', flags: 64 });
-    
-    // Update the session embed and reopen for new joiners
-    await reopenLfg(session);
 }
 
 async function handleEndLfgCommand(interaction) {
