@@ -972,32 +972,50 @@ async function handleLfgTimeout(sessionId) {
                 await originalMessage.edit({ embeds: [embed], components: [] });
                 console.log(`Updated original LFG message for expired session ${sessionId}`);
                 messageUpdated = true;
-            } else {
-                // Fallback: try to find the message if no ID stored
+            }
+        } catch (error) {
+            console.error('Error updating original message with stored ID:', error);
+        }
+        
+        // If direct message update failed, try multiple fallback searches
+        if (!messageUpdated) {
+            try {
+                // Fallback 1: Search by session ID in footer
                 const messages = await channel.messages.fetch({ limit: 50 });
-                const originalMessage = messages.find(msg => 
+                let originalMessage = messages.find(msg => 
                     msg.embeds.length > 0 && 
-                    msg.embeds[0].footer?.text?.includes(sessionId.slice(-6))
+                    msg.embeds[0].footer?.text?.includes(sessionId.slice(-6)) &&
+                    msg.components.length > 0 &&
+                    msg.components[0].components.some(comp => comp.customId?.includes(`join_lfg_${sessionId}`))
                 );
                 
                 if (originalMessage) {
                     await originalMessage.edit({ embeds: [embed], components: [] });
-                    console.log(`Updated LFG message using fallback search for session ${sessionId}`);
+                    console.log(`Updated LFG message using session ID search for expired session ${sessionId}`);
                     messageUpdated = true;
+                } else {
+                    // Fallback 2: Extended search in more messages
+                    const moreMessages = await channel.messages.fetch({ limit: 100 });
+                    originalMessage = moreMessages.find(msg => 
+                        msg.embeds.length > 0 && 
+                        msg.embeds[0].title?.includes(session.game) &&
+                        msg.embeds[0].footer?.text?.includes(sessionId.slice(-6))
+                    );
+                    
+                    if (originalMessage) {
+                        await originalMessage.edit({ embeds: [embed], components: [] });
+                        console.log(`Updated LFG message using extended search for expired session ${sessionId}`);
+                        messageUpdated = true;
+                    }
                 }
+            } catch (error) {
+                console.error('Error in fallback message searches:', error);
             }
-        } catch (error) {
-            console.error('Error updating original message:', error);
         }
         
-        // If we couldn't update the original message, send a new one
+        // If we still couldn't update the original message, don't create a new one - just log it
         if (!messageUpdated) {
-            try {
-                await channel.send({ embeds: [embed] });
-                console.log(`Sent new expiry message for session ${sessionId} since original couldn't be updated`);
-            } catch (sendError) {
-                console.error('Error sending new expiry message:', sendError);
-            }
+            console.log(`Could not find original message for expired session ${sessionId} - message may have been deleted`);
         }
         
         // Clean up the voice channel
