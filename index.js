@@ -1177,7 +1177,7 @@ async function finalizeSession(session, interaction) {
             { name: '🔊 Voice Channel', value: `<#${session.voiceChannel}>\n*Click to join voice channel*\n*Private channel for your team only*`, inline: false },
             { name: '🚀 Next Steps', value: '• Join the voice channel above\n• Coordinate with your teammates\n• Have fun gaming together!', inline: false }
         )
-        .setFooter({ text: 'Voice channel auto-deletes when empty or after 2 hours' })
+        .setFooter({ text: 'Voice channel auto-deletes when empty for 5 minutes' })
         .setTimestamp();
     
     await interaction.message.edit({ embeds: [embed], components: [] });
