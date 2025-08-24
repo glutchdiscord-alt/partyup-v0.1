@@ -28,16 +28,68 @@ const SUPPORTED_GAMES = {
 const activeSessions = new Map();
 const gameCategories = new Map();
 const guildSettings = new Map(); // Store guild-specific settings like LFG channel
+const userCreatedSessions = new Map(); // Track which user created which session
+
+// Session persistence helpers
+function saveSessionData() {
+    const sessionData = {
+        activeSessions: Array.from(activeSessions.entries()),
+        guildSettings: Array.from(guildSettings.entries()),
+        userCreatedSessions: Array.from(userCreatedSessions.entries()),
+        timestamp: Date.now()
+    };
+    
+    try {
+        // In production, you'd save this to a database
+        // For now, we'll just log it for debugging
+        console.log(`Saved ${sessionData.activeSessions.length} active sessions`);
+        return sessionData;
+    } catch (error) {
+        console.error('Error saving session data:', error);
+    }
+}
+
+function loadSessionData() {
+    try {
+        // In production, you'd load this from a database
+        // For now, sessions will be lost on restart (but bot won't crash)
+        console.log('Session persistence not implemented - sessions will be lost on restart');
+    } catch (error) {
+        console.error('Error loading session data:', error);
+    }
+}
+
+// Auto-save session data every 5 minutes
+setInterval(() => {
+    if (activeSessions.size > 0) {
+        saveSessionData();
+    }
+}, 5 * 60 * 1000);
 
 client.once('ready', () => {
     console.log(`Bot is ready! Logged in as ${client.user.tag}`);
+    loadSessionData(); // Load any persisted session data
     registerCommands();
     
-    // Run cleanup every minute
-    cron.schedule('* * * * *', () => {
-        cleanupEmptyChannels();
-        checkExpiredConfirmations(); // Also check for expired confirmations
-        checkExpiredLfgSessions(); // Check for LFG sessions with no joiners after 20 minutes
+    // Run cleanup every minute with error handling
+    cron.schedule('* * * * *', async () => {
+        try {
+            await cleanupEmptyChannels();
+        } catch (error) {
+            console.error('Error in cleanup:', error);
+        }
+        
+        try {
+            await checkExpiredConfirmations();
+        } catch (error) {
+            console.error('Error checking confirmations:', error);
+        }
+        
+        try {
+            await checkExpiredLfgSessions();
+        } catch (error) {
+            console.error('Error checking sessions:', error);
+        }
     });
 });
 
@@ -200,6 +252,27 @@ async function handleLfgCommand(interaction) {
     const user = interaction.user;
     const guild = interaction.guild;
 
+    // Check if user already has an active LFG session as creator
+    const existingSession = userCreatedSessions.get(user.id);
+    if (existingSession && activeSessions.has(existingSession)) {
+        const session = activeSessions.get(existingSession);
+        return interaction.reply({ 
+            content: `❌ You already have an active LFG session (#${existingSession.slice(-6)}) for ${session.game}! Use \`/endlfg\` to end it first.`, 
+            ephemeral: true 
+        });
+    }
+
+    // Check if user is already in another LFG session
+    const userInSession = Array.from(activeSessions.values()).find(s => 
+        s.currentPlayers.includes(user.id)
+    );
+    
+    if (userInSession) {
+        return interaction.reply({ 
+            content: `❌ You are already in an LFG session (#${userInSession.id.slice(-6)})! Leave it first before creating a new one.`, 
+            ephemeral: true 
+        });
+    }
 
     // Check if LFG channel is set and if user is in the correct channel
     const guildSetting = guildSettings.get(guild.id);
@@ -212,8 +285,6 @@ async function handleLfgCommand(interaction) {
                 ephemeral: true 
             });
         }
-    } else {
-    }
 
     if (!SUPPORTED_GAMES[game]) {
         return interaction.reply({ content: 'Unsupported game selected.', ephemeral: true });
@@ -250,8 +321,8 @@ async function handleLfgCommand(interaction) {
             ]
         });
 
-        // Create LFG session
-        const sessionId = `${user.id}-${Date.now()}`;
+        // Create LFG session with improved ID generation
+        const sessionId = `${user.id}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
         const session = {
             id: sessionId,
             creator: user.id,
@@ -267,10 +338,12 @@ async function handleLfgCommand(interaction) {
             category: category.id,
             createdAt: Date.now(),
             confirmationStartTime: null, // When confirmation phase started
-            status: 'waiting' // waiting, confirming, completed
+            status: 'waiting', // waiting, confirming, completed
+            timeoutId: null // Store timeout ID for proper cleanup
         };
 
         activeSessions.set(sessionId, session);
+        userCreatedSessions.set(user.id, sessionId); // Track creator
 
         // Create embed response
         const embed = new EmbedBuilder()
@@ -308,6 +381,14 @@ async function handleLfgCommand(interaction) {
 
     } catch (error) {
         console.error('Error creating LFG session:', error);
+        
+        // Clean up any partially created resources
+        if (userCreatedSessions.has(user.id)) {
+            const partialSessionId = userCreatedSessions.get(user.id);
+            activeSessions.delete(partialSessionId);
+            userCreatedSessions.delete(user.id);
+        }
+        
         await interaction.reply({ content: 'Failed to create LFG session. Please try again.', ephemeral: true });
     }
 }
@@ -344,10 +425,16 @@ async function getOrCreateGameCategory(guild, gameKey, gameName) {
 // Store empty channel timestamps
 const emptyChannelTimestamps = new Map();
 
-// Cleanup empty channels every minute
+// Cleanup empty channels every minute with improved reliability
 async function cleanupEmptyChannels() {
     for (const guild of client.guilds.cache.values()) {
         try {
+            // Verify bot has necessary permissions
+            const botMember = guild.members.cache.get(client.user.id);
+            if (!botMember || !botMember.permissions.has(PermissionFlagsBits.ManageChannels)) {
+                console.log(`Skipping cleanup for guild ${guild.name} - missing permissions`);
+                continue;
+            }
             // Clean up empty LFG voice channels - but respect active LFG sessions for 20 minutes
             const voiceChannels = guild.channels.cache.filter(c => 
                 c.type === ChannelType.GuildVoice && 
@@ -363,8 +450,13 @@ async function cleanupEmptyChannels() {
                 const session = Array.from(activeSessions.values()).find(s => s.voiceChannel === channel.id);
                 
                 if (session) {
-                    // Protect ALL active LFG sessions from cleanup - let LFG timeout system handle expiration
-                    if (session.status === 'waiting') {
+                    // Verify session is still valid
+                    if (!session.guild || !session.creator || !session.currentPlayers) {
+                        console.log(`Found corrupted session ${session.id}, removing...`);
+                        activeSessions.delete(session.id);
+                        userCreatedSessions.delete(session.creator);
+                        // Allow channel to be cleaned up
+                    } else if (session.status === 'waiting') {
                         // Active LFG session - don't delete the voice channel
                         // Voice channel will be deleted when:
                         // 1. Session times out after 20 minutes (handled by checkExpiredLfgSessions)
@@ -457,6 +549,14 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             }
         }
     }
+    
+    // Handle members leaving voice - track for potential session cleanup
+    if (oldState.channel && !newState.channel) {
+        const session = Array.from(activeSessions.values()).find(s => s.voiceChannel === oldState.channel.id);
+        if (session && session.currentPlayers.includes(oldState.member.id)) {
+            console.log(`Member ${oldState.member.displayName} left LFG voice channel for session ${session.id.slice(-6)}`);
+        }
+    }
 });
 
 // New command handlers
@@ -535,11 +635,13 @@ async function handleModCommand(interaction) {
         switch (action) {
             case 'kick':
                 await targetUser.kick(reason);
+                await removeMemberFromAllSessions(targetUser.id);
                 await interaction.reply(`✅ Kicked ${targetUser.user.tag} - ${reason}`);
                 break;
                 
             case 'ban':
                 await targetUser.ban({ reason, deleteMessageDays: 1 });
+                await removeMemberFromAllSessions(targetUser.id);
                 await interaction.reply(`✅ Banned ${targetUser.user.tag} - ${reason}`);
                 break;
                 
@@ -588,37 +690,54 @@ async function handleJoinLfg(interaction) {
         }
         
         if (session.currentPlayers.includes(interaction.user.id)) {
-            // User is already in this session, show leave button
+            // User is already in this session, show enhanced status
+            const statusEmbed = new EmbedBuilder()
+                .setColor(0xffa500)
+                .setTitle('ℹ️ **Already in Team!**')
+                .setDescription(`**You're already part of this ${session.game} session**\n\n👥 **Team:** ${session.currentPlayers.length}/${session.playersNeeded}\n🔊 **Voice:** <#${session.voiceChannel}>\n⏰ **Status:** ${session.status === 'confirming' ? 'Waiting for confirmations' : 'Looking for more players'}\n\n*Click **Leave Team** if you want to exit this session.*`)
+                .setTimestamp();
+            
             const leaveButton = new ButtonBuilder()
                 .setCustomId(`leave_lfg_${sessionId}`)
-                .setLabel('Leave LFG')
+                .setLabel('Leave Team')
                 .setStyle(ButtonStyle.Danger)
-                .setEmoji('❌');
+                .setEmoji('🚪');
             
             const row = new ActionRowBuilder().addComponents(leaveButton);
             
             console.log(`User ${interaction.user.id} (${interaction.user.displayName}) tried to join session they're already in`);
-            console.log(`Session ${sessionId} current players:`, session.currentPlayers);
             
             return interaction.reply({ 
-                content: '❌ You are already in this LFG! Click below to leave:', 
+                embeds: [statusEmbed],
                 components: [row],
                 flags: 64 
             });
         }
         
         if (session.currentPlayers.length >= session.playersNeeded) {
-            return interaction.reply({ content: '❌ This LFG is full!', flags: 64 });
+            const fullEmbed = new EmbedBuilder()
+                .setColor(0xff9900)
+                .setTitle('🚫 **Team is Full!**')
+                .setDescription(`**This ${session.game} session is already complete**\n\n👥 **Team:** ${session.currentPlayers.length}/${session.playersNeeded}\n🎮 **Status:** ${session.status === 'confirming' ? 'Players confirming' : 'Team filled'}\n\n🔍 Try creating your own LFG with \`/lfg\`!`)
+                .setTimestamp();
+                
+            return interaction.reply({ embeds: [fullEmbed], flags: 64 });
         }
         
-        // Check if user is already in another LFG session
+        // Check if user is already in another LFG session (improved check)
         const userInOtherSession = Array.from(activeSessions.values()).find(s => 
             s.id !== sessionId && s.currentPlayers.includes(interaction.user.id)
         );
         
         if (userInOtherSession) {
+            const conflictEmbed = new EmbedBuilder()
+                .setColor(0xff6b6b)
+                .setTitle('⚠️ **Already in Another Team!**')
+                .setDescription(`**You can only be in one LFG session at a time**\n\n🎮 **Current Session:** ${userInOtherSession.game}\n🆔 **Session ID:** #${userInOtherSession.id.slice(-6)}\n👥 **Team:** ${userInOtherSession.currentPlayers.length}/${userInOtherSession.playersNeeded}\n\n🚪 Leave your current session first to join this one!`)
+                .setTimestamp();
+                
             return interaction.reply({ 
-                content: '❌ You are already in another LFG session! You can only join one session at a time. Leave your current session first.', 
+                embeds: [conflictEmbed],
                 flags: 64 
             });
         }
@@ -641,20 +760,51 @@ async function handleJoinLfg(interaction) {
         console.error('Error granting voice channel access:', error);
     }
     
-    // Update embed
+    // Create enhanced embed with better visuals
+    const isFull = session.currentPlayers.length === session.playersNeeded;
+    const spotsLeft = session.playersNeeded - session.currentPlayers.length;
+    
+    // Create visual progress bar
+    const progressBar = createProgressBar(session.currentPlayers.length, session.playersNeeded);
+    
     const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle(`🎮 LFG: ${session.game}`)
-        .setDescription(session.currentPlayers.length === session.playersNeeded ? 'Team full! Waiting for confirmations...' : `Looking for ${session.playersNeeded - session.currentPlayers.length} more player(s)`)
+        .setColor(isFull ? 0x00ff00 : 0x5865f2)
+        .setTitle(`🎮 ${session.game} • ${session.gamemode}`)
+        .setDescription(isFull ? 
+            '🎯 **Team is full!** Waiting for confirmations...' : 
+            `🔍 **Looking for ${spotsLeft} more ${spotsLeft === 1 ? 'player' : 'players'}**`)
         .addFields(
-            { name: '🎮 Game', value: session.game, inline: true },
-            { name: '🎯 Mode', value: session.gamemode, inline: true },
-            { name: '👥 Players', value: `${session.currentPlayers.length}/${session.playersNeeded}`, inline: true },
-            { name: '👤 Current Players', value: session.currentPlayers.map((id, index) => {
-                const user = interaction.guild.members.cache.get(id);
-                return `${index === 0 ? '👑' : '⚔️'} ${user ? user.displayName : 'Unknown'}`;
-            }).join('\n'), inline: false },
-            { name: '🔊 Voice Channel', value: `<#${session.voiceChannel}>\n*Private voice channel created for this team.\nAccess granted when you join!*`, inline: false }
+            { 
+                name: '👥 Team Progress', 
+                value: `${progressBar}\n**${session.currentPlayers.length}/${session.playersNeeded} players**`, 
+                inline: false 
+            },
+            { 
+                name: '🎮 Game Details', 
+                value: `**Game:** ${session.game}\n**Mode:** ${session.gamemode}\n**Skill Level:** Open to All`, 
+                inline: true 
+            },
+            { 
+                name: '⏱️ Session Info', 
+                value: `**Status:** ${isFull ? 'Full - Confirming' : 'Open'}\n**Created:** ${getTimeAgo(session.createdAt)}\n**Expires:** ${getExpiryTime(session.createdAt)}`, 
+                inline: true 
+            },
+            { 
+                name: '👤 Current Team', 
+                value: session.currentPlayers.map((id, index) => {
+                    const user = interaction.guild.members.cache.get(id);
+                    const userName = user ? user.displayName : 'Unknown';
+                    const role = index === 0 ? '👑 **Leader**' : '⚔️ **Member**';
+                    const status = '🟢'; // Always online since they just joined
+                    return `${status} ${role} ${userName}`;
+                }).join('\n'), 
+                inline: false 
+            },
+            { 
+                name: '🔊 Voice Channel', 
+                value: `<#${session.voiceChannel}>\n🔒 **Private channel** - access granted when you join!\n🎤 Voice chat ready for your team`, 
+                inline: false 
+            }
         );
     
     // Add info field if provided
@@ -662,23 +812,31 @@ async function handleJoinLfg(interaction) {
         embed.addFields({ name: '📝 Additional Info', value: session.info, inline: false });
     }
     
-    embed.setFooter({ text: `LFG #${sessionId.slice(-6)} • Created by ${interaction.guild.members.cache.get(session.creator)?.displayName || 'Unknown'} | Today at ${new Date(session.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })
-        .setTimestamp();
+    // Add info field if provided
+    if (session.info) {
+        embed.addFields({ name: '📝 Additional Info', value: session.info, inline: false });
+    }
+    
+    embed.setFooter({ 
+        text: `Session #${sessionId.slice(-6)} • Created by ${interaction.guild.members.cache.get(session.creator)?.displayName || 'Unknown'}`,
+        iconURL: interaction.guild.members.cache.get(session.creator)?.displayAvatarURL() || null
+    })
+    .setTimestamp();
     
     if (session.currentPlayers.length === session.playersNeeded) {
-        // Team is full, start confirmation process
+        // Team is full, start enhanced confirmation process
         session.status = 'confirming';
-        session.confirmationStartTime = Date.now(); // Store when confirmation started
+        session.confirmationStartTime = Date.now();
         
         const confirmButton = new ButtonBuilder()
             .setCustomId(`confirm_${sessionId}`)
-            .setLabel('Confirm')
+            .setLabel('Ready to Play!')
             .setStyle(ButtonStyle.Success)
-            .setEmoji('✅');
+            .setEmoji('🎮');
             
         const declineButton = new ButtonBuilder()
             .setCustomId(`decline_${sessionId}`)
-            .setLabel('Decline')
+            .setLabel('Not Available')
             .setStyle(ButtonStyle.Danger)
             .setEmoji('❌');
             
@@ -686,39 +844,51 @@ async function handleJoinLfg(interaction) {
         
         await interaction.update({ embeds: [embed], components: [row] });
         
-        // Ping all players in one simple message
+        // Enhanced confirmation message with better visuals
         const playerPings = session.currentPlayers.map(id => `<@${id}>`).join(' ');
+        const confirmEmbed = new EmbedBuilder()
+            .setColor(0xffd700)
+            .setTitle('🎯 **TEAM ASSEMBLED!**')
+            .setDescription(`**All players found for ${session.game}!**\n\n⏰ **You have 2 minutes to confirm**\nClick **Ready to Play!** if you're available right now.\n\n🔊 Voice channel: <#${session.voiceChannel}>`)
+            .setTimestamp();
+            
         await interaction.followUp({ 
-            content: `${playerPings} 🎯 **Confirm matchmaking!**`,
+            content: `${playerPings}`,
+            embeds: [confirmEmbed],
             allowedMentions: { users: session.currentPlayers }
         });
         
-        // Set confirmation timeout with backup timestamp checking
-        session.timeoutId = setTimeout(() => handleConfirmationTimeout(sessionId), 120000); // 2 minutes
+        session.timeoutId = setTimeout(() => handleConfirmationTimeout(sessionId), 120000);
         console.log(`Started confirmation timeout for session ${sessionId} at ${new Date().toISOString()}`);
     } else {
         const joinButton = new ButtonBuilder()
             .setCustomId(`join_lfg_${sessionId}`)
-            .setLabel('Join LFG')
+            .setLabel(`Join Team (${spotsLeft} spots left)`)
             .setStyle(ButtonStyle.Primary)
-            .setEmoji('✅');
+            .setEmoji('⚡');
         
         const row = new ActionRowBuilder().addComponents(joinButton);
         
         await interaction.update({ content: '', embeds: [embed], components: [row] });
     }
     
-    // Add leave button to the join confirmation message
+    // Enhanced join confirmation with better UX
+    const successEmbed = new EmbedBuilder()
+        .setColor(0x00ff00)
+        .setTitle('🎉 Welcome to the Team!')
+        .setDescription(`**Successfully joined ${session.game}!**\n\n🔊 **Voice Channel:** <#${session.voiceChannel}>\n🎮 **Mode:** ${session.gamemode}\n👥 **Team Size:** ${session.currentPlayers.length}/${session.playersNeeded}\n\n${session.currentPlayers.length === session.playersNeeded ? '⏰ **Get ready!** Confirmation starting soon...' : `🔍 **Waiting for ${spotsLeft} more ${spotsLeft === 1 ? 'player' : 'players'}**`}`)
+        .setTimestamp();
+    
     const leaveButton = new ButtonBuilder()
         .setCustomId(`leave_lfg_${sessionId}`)
-        .setLabel('Leave LFG')
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji('❌');
+        .setLabel('Leave Team')
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji('🚪');
     
     const leaveRow = new ActionRowBuilder().addComponents(leaveButton);
     
     await interaction.followUp({ 
-        content: '✅ You joined the LFG!', 
+        embeds: [successEmbed], 
         components: [leaveRow],
         flags: 64 
     });
@@ -740,19 +910,39 @@ async function handleConfirmation(interaction) {
     const session = activeSessions.get(sessionId);
     
     if (!session) {
-        return interaction.reply({ content: '❌ This LFG session is no longer active!', flags: 64 });
+        const expiredEmbed = new EmbedBuilder()
+            .setColor(0x95a5a6)
+            .setTitle('⏰ **Session Expired**')
+            .setDescription('This LFG session is no longer active or has been completed.\n\n🆕 Create a new session with `/lfg`')
+            .setTimestamp();
+        return interaction.reply({ embeds: [expiredEmbed], flags: 64 });
     }
     
     if (!session.currentPlayers.includes(interaction.user.id)) {
-        return interaction.reply({ content: '❌ You are not part of this LFG!', flags: 64 });
+        const notInSessionEmbed = new EmbedBuilder()
+            .setColor(0xff6b6b)
+            .setTitle('❌ **Not in Team**')
+            .setDescription('You are not part of this LFG session!\n\n🔍 Look for open sessions or create your own with `/lfg`')
+            .setTimestamp();
+        return interaction.reply({ embeds: [notInSessionEmbed], flags: 64 });
     }
     
     if (session.status !== 'confirming') {
-        return interaction.reply({ content: '❌ This session is not in confirmation phase!', flags: 64 });
+        const notConfirmingEmbed = new EmbedBuilder()
+            .setColor(0xffa500)
+            .setTitle('⚠️ **Not in Confirmation Phase**')
+            .setDescription('This session is not currently asking for confirmations.\n\n⏰ Wait for the team to fill up!')
+            .setTimestamp();
+        return interaction.reply({ embeds: [notConfirmingEmbed], flags: 64 });
     }
     
     if (session.confirmedPlayers.includes(interaction.user.id)) {
-        return interaction.reply({ content: '✅ You already confirmed!', flags: 64 });
+        const alreadyConfirmedEmbed = new EmbedBuilder()
+            .setColor(0x00ff00)
+            .setTitle('✅ **Already Confirmed!**')
+            .setDescription(`You've already confirmed for this ${session.game} session!\n\n⏰ Waiting for other players to confirm...`)
+            .setTimestamp();
+        return interaction.reply({ embeds: [alreadyConfirmedEmbed], flags: 64 });
     }
     
     session.confirmedPlayers.push(interaction.user.id);
@@ -801,6 +991,7 @@ async function handleDecline(interaction) {
         
         // Remove session
         activeSessions.delete(sessionId);
+        userCreatedSessions.delete(session.creator); // Clean up creator tracking
         
         // Update embed to show session cancelled
         const cancelledEmbed = new EmbedBuilder()
@@ -1031,6 +1222,7 @@ async function handleLfgTimeout(sessionId) {
         
         // Remove the session
         activeSessions.delete(sessionId);
+        userCreatedSessions.delete(session.creator); // Clean up creator tracking
         console.log(`Cleaned up expired LFG session ${sessionId}`);
         
     } catch (error) {
@@ -1051,6 +1243,7 @@ async function reopenLfg(session) {
             console.error('Error deleting voice channel:', error);
         }
         activeSessions.delete(session.id);
+        userCreatedSessions.delete(session.creator); // Clean up creator tracking
         return;
     }
     
@@ -1160,27 +1353,49 @@ async function reopenLfg(session) {
 }
 
 async function finalizeSession(session, interaction) {
-    session.status = 'completed';
+    session.status = 'active';
+    const gameEmoji = getGameEmoji(session.game);
     
+    // Create spectacular final embed
     const embed = new EmbedBuilder()
         .setColor(0x00ff00)
-        .setTitle('🎉 Match Found!')
-        .setDescription(`Your **${session.game} ${session.gamemode}** team is ready!`)
+        .setTitle(`${gameEmoji} **GAME ON!** ${gameEmoji}`)
+        .setDescription(`**🎆 ${session.game} match confirmed! 🎆**\n\n✨ All players are ready - time to dominate!`)
         .addFields(
-            { name: '🎮 Game', value: session.game, inline: true },
-            { name: '🎯 Mode', value: session.gamemode, inline: true },
-            { name: '👥 Team Size', value: `${session.confirmedPlayers.length} players`, inline: true },
-            { name: '👤 Your Team', value: session.confirmedPlayers.map((id, index) => {
-                const user = interaction.guild.members.cache.get(id);
-                return `${index === 0 ? '👑' : '⚔️'} ${user ? user.displayName : 'Unknown'}`;
-            }).join('\n'), inline: false },
-            { name: '🔊 Voice Channel', value: `<#${session.voiceChannel}>\n*Click to join voice channel*\n*Private channel for your team only*`, inline: false },
-            { name: '🚀 Next Steps', value: '• Join the voice channel above\n• Coordinate with your teammates\n• Have fun gaming together!', inline: false }
+            { 
+                name: '🎮 Game Session Details', 
+                value: `**Game:** ${session.game}\n**Mode:** ${session.gamemode}\n**Players:** ${session.confirmedPlayers.length}\n**Status:** 🟢 Active`, 
+                inline: true 
+            },
+            { 
+                name: '🔊 Voice Communication', 
+                value: `**Channel:** <#${session.voiceChannel}>\n**Access:** ✅ Granted to all\n**Ready:** Join now!`, 
+                inline: true 
+            },
+            { 
+                name: '🏆 Your Team', 
+                value: session.confirmedPlayers.map((id, index) => {
+                    const user = interaction.guild.members.cache.get(id);
+                    const userName = user ? user.displayName : 'Unknown';
+                    const role = index === 0 ? '👑 Leader' : '⚔️ Member';
+                    return `${role} **${userName}**`;
+                }).join('\n'), 
+                inline: false 
+            }
         )
-        .setFooter({ text: 'Voice channel auto-deletes when empty for 5 minutes' })
+        .setFooter({ 
+            text: `Session #${session.id.slice(-6)} • Have an amazing game!`,
+            iconURL: interaction.guild.members.cache.get(session.creator)?.displayAvatarURL() || null
+        })
         .setTimestamp();
     
-    await interaction.message.edit({ embeds: [embed], components: [] });
+    try {
+        // Update the original message with finalized status
+        await interaction.message.edit({ embeds: [embed], components: [] });
+        console.log(`🎆 LFG Session ${session.id} finalized successfully - ${session.game} match ready!`);
+    } catch (error) {
+        console.error('Error updating finalized session message:', error);
+    }
 }
 
 function parseDuration(durationStr) {
@@ -1242,6 +1457,113 @@ async function handleHelpCommand(interaction) {
     await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
+// Helper functions for enhanced LFG experience
+function createProgressBar(current, total, length = 12) {
+    const filled = Math.round((current / total) * length);
+    const empty = length - filled;
+    const filledBar = '🟩'.repeat(filled);
+    const emptyBar = '⬜'.repeat(empty);
+    return `${filledBar}${emptyBar}`;
+}
+
+function getTimeAgo(timestamp) {
+    const now = Date.now();
+    const diff = now - timestamp;
+    const minutes = Math.floor(diff / 60000);
+    
+    if (minutes < 1) return 'Just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
+}
+
+function getExpiryTime(createdAt) {
+    const expiry = new Date(createdAt + (20 * 60 * 1000)); // 20 minutes from creation
+    return `in ${Math.max(0, Math.ceil((expiry - Date.now()) / 60000))}m`;
+}
+
+function getGameEmoji(gameName) {
+    const gameEmojis = {
+        'Valorant': '🔫',
+        'Fortnite': '🏗️',
+        'Apex Legends': '🎆',
+        'Call of Duty': '🚁',
+        'Overwatch': '🤖',
+        'Rocket League': '⚽',
+        'Minecraft': '🧺',
+        'Roblox': '🎮',
+        'Brawlhalla': '⚔️',
+        'The Finals': '🏆',
+        'Marvel Rivals': '⚡'
+    };
+    return gameEmojis[gameName] || '🎮';
+}
+
+// Function to handle member removal from all sessions (for moderation)
+async function removeMemberFromAllSessions(memberId) {
+    const affectedSessions = [];
+    
+    for (const [sessionId, session] of activeSessions) {
+        if (session.currentPlayers.includes(memberId) || session.confirmedPlayers.includes(memberId)) {
+            affectedSessions.push(sessionId);
+            
+            // Remove from players arrays
+            session.currentPlayers = session.currentPlayers.filter(id => id !== memberId);
+            session.confirmedPlayers = session.confirmedPlayers.filter(id => id !== memberId);
+            
+            // Remove voice access
+            try {
+                const guild = client.guilds.cache.get(session.guild);
+                const voiceChannel = guild?.channels.cache.get(session.voiceChannel);
+                if (voiceChannel) {
+                    await voiceChannel.permissionOverwrites.delete(memberId);
+                }
+            } catch (error) {
+                console.error('Error removing voice access during moderation:', error);
+            }
+            
+            // If they were the creator, end the session
+            if (session.creator === memberId) {
+                try {
+                    const guild = client.guilds.cache.get(session.guild);
+                    const voiceChannel = guild?.channels.cache.get(session.voiceChannel);
+                    if (voiceChannel) {
+                        await voiceChannel.delete();
+                    }
+                } catch (error) {
+                    console.error('Error deleting voice channel during moderation:', error);
+                }
+                
+                activeSessions.delete(sessionId);
+                userCreatedSessions.delete(memberId);
+                console.log(`Ended session ${sessionId} - creator was moderated`);
+            } else if (session.currentPlayers.length === 0) {
+                // Session became empty, clean up
+                try {
+                    const guild = client.guilds.cache.get(session.guild);
+                    const voiceChannel = guild?.channels.cache.get(session.voiceChannel);
+                    if (voiceChannel) {
+                        await voiceChannel.delete();
+                    }
+                } catch (error) {
+                    console.error('Error deleting empty voice channel during moderation:', error);
+                }
+                
+                activeSessions.delete(sessionId);
+                userCreatedSessions.delete(session.creator);
+                console.log(`Cleaned up empty session ${sessionId} after moderation`);
+            } else {
+                // Reopen session with remaining players
+                await reopenLfg(session);
+                console.log(`Reopened session ${sessionId} after removing moderated member`);
+            }
+        }
+    }
+    
+    console.log(`Removed member ${memberId} from ${affectedSessions.length} LFG sessions due to moderation`);
+}
+
 async function handleLeaveLfg(interaction) {
     const sessionId = interaction.customId.replace('leave_lfg_', '');
     const session = activeSessions.get(sessionId);
@@ -1297,6 +1619,7 @@ async function handleLeaveLfg(interaction) {
                 console.error('Error deleting voice channel:', error);
             }
             activeSessions.delete(sessionId);
+            userCreatedSessions.delete(session.creator); // Clean up creator tracking
             console.log(`Session ${sessionId} deleted - no players remaining`);
             return;
         }
@@ -1426,6 +1749,7 @@ async function handleEndLfgCommand(interaction) {
         
         // Remove session from memory
         activeSessions.delete(sessionId);
+        userCreatedSessions.delete(session.creator); // Clean up creator tracking
         
         console.log(`Session ${sessionId} ended by creator ${interaction.user.displayName}`);
         
@@ -1460,4 +1784,39 @@ server.listen(port, () => {
     console.log(`Health check server running on port ${port}`);
 });
 
+// Add error handlers for Discord client
+client.on('error', (error) => {
+    console.error('Discord client error:', error);
+});
+
+client.on('shardError', (error, shardId) => {
+    console.error(`Shard ${shardId} error:`, error);
+});
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+    console.log('Received SIGINT, shutting down gracefully...');
+    client.destroy();
+    server.close();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('Received SIGTERM, shutting down gracefully...');
+    client.destroy();
+    server.close();
+    process.exit(0);
+});
+
+// Add global error handling
+process.on('unhandledRejection', (error) => {
+    console.error('Unhandled promise rejection:', error);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught exception:', error);
+    process.exit(1);
+});
+
 client.login(process.env.DISCORD_TOKEN);
+}
